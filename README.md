@@ -126,6 +126,11 @@ UNAUTHORIZED sender: +91YYYYYYYYYY -> ignore & delete
 - Message text is stored/displayed up to 299 characters.
 - The GSM character set is configured for standard GSM text; Unicode (e.g., Devanagari) SMS is not supported by this sketch.
 
+## Related
+
+- [**Embedded systems reference**](https://github.com/ChitranshBaregama/embedded-systems-resources) — bare-metal firmware notes and runnable Cortex-M examples. The [UART document](https://github.com/ChitranshBaregama/embedded-systems-resources/blob/main/peripherals/uart.md) and the [state machine document](https://github.com/ChitranshBaregama/embedded-systems-resources/blob/main/patterns/state-machines.md) cover the two techniques this sketch leans on hardest — a notification-independent serial engine, and an AT transaction driven as an explicit state machine with a timeout.
+- [**DLMS/COSEM security reference**](https://github.com/ChitranshBaregama/EncryptionAlgorithm-) — seven volumes on smart-metering protocol security.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
