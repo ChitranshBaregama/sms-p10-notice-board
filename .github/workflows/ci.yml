@@ -1,0 +1,22 @@
+name: build and test
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  sender-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: g++ -std=c++11 -Wall -Wextra -Werror -fsanitize=address,undefined tests/test_phone_match.cpp -o test_phone_match
+      - run: ./test_phone_match
+      - run: g++ -std=c++11 -Wall -Wextra -Werror -fsanitize=address,undefined tests/test_protocol.cpp -o test_protocol
+      - run: ./test_protocol
+  mega-compile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: arduino/setup-arduino-cli@v2
+        with:
+          version: '1.2.2'
+      - run: arduino-cli core update-index
+      - run: arduino-cli core install arduino:avr@1.8.6
+      - run: arduino-cli lib install DMD2@0.0.3
+      - run: arduino-cli compile --fqbn arduino:avr:mega SMS_P10_NoticeBoard
