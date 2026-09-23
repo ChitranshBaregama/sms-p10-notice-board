@@ -2,15 +2,14 @@
  * SMS -> P10 LED SCROLLING NOTICE BOARD
  *
  * Send an SMS from an authorized (admin) phone number and it scrolls
- * on a P10 LED matrix display. Designed to run 24/7 unattended.
+ * on a P10 LED matrix display. A prototype; unattended reliability requires hardware validation.
  *
  * FEATURES:
  *  - Admin authentication: only whitelisted sender numbers are
  *    displayed (last-10-digit match). Others are deleted & ignored.
  *  - Notification-independent architecture: +CMTI URC is only a
  *    trigger; actual reading is done via AT+CMGL="ALL" polling with
- *    a 10 s fallback poll. A missed notification can never cause a
- *    lost message.
+ *    a 10 s fallback poll to recover from missed notifications.
  *  - Message queueing: a new SMS waits until the current message
  *    finishes its scroll pass, then takes over.
  *  - Windowed rendering: only the ~13 visible characters are drawn
@@ -38,7 +37,9 @@
  *   Never power either from the Arduino 5 V pin.
  *********************************************************************/
 
+#ifndef DEBUG_ENABLE
 #define DEBUG_ENABLE       1
+#endif
 #define PERSIST_SMS_EEPROM 1
 #define AUTH_ENABLE        1     // 0 = allow all numbers (for testing)
 
@@ -70,16 +71,23 @@ const char *ADMIN_NUMBERS[] = {
   #define DBG_PRINTLN(x)
 #endif
 
+#ifndef P10_HOST_TEST
+#include <Arduino.h>
 #include <SPI.h>
+#endif
+#include "phone_match.h"
+
+void gsmRxProcess();
+#ifndef P10_HOST_TEST
 #include <DMD2.h>
 #include <fonts/SystemFont5x7.h>
+#endif
 
 #if PERSIST_SMS_EEPROM
+  #ifndef P10_HOST_TEST
   #include <EEPROM.h>
-  #define EE_MAGIC_ADDR 0
-  #define EE_LEN_ADDR   1
-  #define EE_MSG_ADDR   3
-  #define EE_MAGIC      0xA5
+  #endif
+  #include "message_store.h"
 #endif
 
 #define GSM      Serial2
@@ -103,7 +111,12 @@ bool pendingAvailable = false;
 
 /* ================= GSM / SMS STATE ================= */
 char     gsmLine[320];               // fixed line buffer - no String class,
-uint16_t gsmLineLen = 0;             // no heap fragmentation (24/7 safe)
+bool gsmLineOverflow = false;
+uint16_t bodyRemaining = 0;
+uint16_t bodyStored = 0;
+bool captureBody = false;
+bool captureComplete = false;
+uint16_t gsmLineLen = 0;             // no heap allocation in this buffer
 
 enum SmsRxState {
   SMS_IDLE,         // no transaction in progress
@@ -138,15 +151,8 @@ int freeRam() {
 /* ================= AUTHENTICATION ================= */
 bool isAdmin(const char *num) {
 #if AUTH_ENABLE
-  size_t nl = strlen(num);
   for (uint8_t i = 0; i < ADMIN_COUNT; i++) {
-    const char *adm = ADMIN_NUMBERS[i];
-    size_t al = strlen(adm);
-    size_t cmp = 10;                       // compare last 10 digits
-    if (nl < cmp) cmp = nl;
-    if (al < cmp) cmp = al;
-    if (cmp == 0) continue;
-    if (strcmp(num + nl - cmp, adm + al - cmp) == 0) return true;
+    if (phoneMatches(num, ADMIN_NUMBERS[i])) return true;
   }
   return false;
 #else
@@ -159,6 +165,8 @@ bool isAdmin(const char *num) {
    +CMGL: 1,"REC UNREAD","+919876543210","","date"
    field 1 = REC UNREAD, field 2 = sender number              */
 bool extractQuoted(const char *line, uint8_t fieldNum, char *out, size_t outSize) {
+  if (!out || outSize == 0 || fieldNum == 0) return false;
+  out[0] = '\0';
   const char *p = line;
   for (uint8_t f = 0; f < fieldNum; f++) {
     p = strchr(p, '"');                    // opening quote
@@ -168,7 +176,7 @@ bool extractQuoted(const char *line, uint8_t fieldNum, char *out, size_t outSize
     if (!p) return false;
     if (f == fieldNum - 1) {
       size_t len = (size_t)(p - start);
-      if (len >= outSize) len = outSize - 1;
+      if (len >= outSize) return false;  // never authorize a truncated field
       memcpy(out, start, len);
       out[len] = '\0';
       return true;
@@ -181,26 +189,13 @@ bool extractQuoted(const char *line, uint8_t fieldNum, char *out, size_t outSize
 /* ================= EEPROM PERSISTENCE ================= */
 #if PERSIST_SMS_EEPROM
 void eepromSaveMsg(const char *msg) {
-  int len = strlen(msg);
-  if (len > MAX_MSG - 1) len = MAX_MSG - 1;
-  EEPROM.update(EE_MAGIC_ADDR, EE_MAGIC);
-  EEPROM.update(EE_LEN_ADDR,     len & 0xFF);
-  EEPROM.update(EE_LEN_ADDR + 1, (len >> 8) & 0xFF);
-  for (int i = 0; i < len; i++) {
-    EEPROM.update(EE_MSG_ADDR + i, msg[i]);   // update() writes changed bytes only
-    gsmRxProcess();   // drain UART during slow writes - prevents RX overflow
-  }
+  MessageStore::save(EEPROM, msg, gsmRxProcess);
 }
 
 bool eepromLoadMsg(char *out, size_t outSize) {
-  if (EEPROM.read(EE_MAGIC_ADDR) != EE_MAGIC) return false;
-  int len = EEPROM.read(EE_LEN_ADDR) | (EEPROM.read(EE_LEN_ADDR + 1) << 8);
-  if (len <= 0 || len >= (int)outSize) return false;
-  for (int i = 0; i < len; i++)
-    out[i] = EEPROM.read(EE_MSG_ADDR + i);
-  out[len] = '\0';
-  return true;
+  return MessageStore::load(EEPROM, out, outSize);
 }
+
 #endif
 
 /* ===================================================== */
@@ -274,7 +269,7 @@ void processScrollingText() {
 /* ==================== GSM CORE ======================= */
 
 /* Send a command and keep draining RX (and servicing the display)
-   while waiting - the 64-byte Serial2 buffer can never overflow */
+   while waiting. Hardware testing must establish the UART overflow margin. */
 void gsmSend(const char *cmd, unsigned long waitMs) {
   DBG_PRINT(F(">> ")); DBG_PRINTLN(cmd);
   GSM.println(cmd);
@@ -292,11 +287,11 @@ void gsmInitModem() {
   gsmSend("AT", 600);                           // autobaud sync
   gsmSend("ATE0", 600);                         // echo OFF (critical for parsing)
   gsmSend("AT+CMGF=1", 600);                    // SMS text mode
-  gsmSend("AT+CSCS=\"GSM\"", 600);              // GSM character set
+  gsmSend("AT+CSCS=\"IRA\"", 600);              // single-byte terminal character set
+  gsmSend("AT+CSDH=1", 600);                   // include body length in CMGL headers
   gsmSend("AT+CPMS=\"SM\",\"SM\",\"SM\"", 1000); // store messages on SIM
   gsmSend("AT+CNMI=2,1,0,0,0", 600);            // new SMS -> +CMTI notification
-  gsmSend("AT+CMGDA=\"DEL ALL\"", 2000);        // wipe old SMS (a full SIM
-                                                // silently blocks new messages)
+  // Preserve stored messages; normal polling reads and deletes individual indexes.
 }
 
 /* ---- Transaction helpers ---- */
@@ -317,94 +312,90 @@ void endTransaction() {
   pollDue = true;   // chain-poll: if more messages are stored, fetch them now
 }
 
-void handleCmglHeader() {
-  readIndex = atoi(gsmLine + 6);
-  char sender[24] = "";
-  extractQuoted(gsmLine, 2, sender, sizeof(sender));
+/* With CSDH=1 the final CMGL field is body length. Count raw IRA
+ * characters before interpreting response lines, even when the body itself
+ * contains OK, ERROR, +CMTI or +CMGL. See SIM800 AT manual 4.2.3/4.2.14. */
+void abortSmsTransaction() {
+  readIndex = -1;
+  bodyRemaining = 0;
+  captureBody = captureComplete = false;
   smsBuffer[0] = '\0';
-
-  if (isAdmin(sender)) {
-    DBG_PRINT(F("SMS from ADMIN: ")); DBG_PRINTLN(sender);
-    setSmsState(SMS_READ_BODY);
-  } else {
-    DBG_PRINT(F("UNAUTHORIZED sender: ")); DBG_PRINT(sender);
-    DBG_PRINTLN(F(" -> ignore & delete"));
-    setSmsState(SMS_SKIP_BODY);
-  }
+  setSmsState(SMS_IDLE);
+  // Defer retry to the periodic poll; do not delete a partial message.
+  pollDue = false;
+  lastPollTime = millis();
 }
 
-/* Process one complete line from the modem */
-void handleGsmLine() {
-  if (gsmLine[0] == '\0') return;
-  DBG_PRINT(F("<< ")); DBG_PRINTLN(gsmLine);
+void handleCmglHeader() {
+  const char *last = strrchr(gsmLine, ',');
+  char *end;
+  long length = last ? strtol(last+1, &end, 10) : -1;
+  if (!last || end == last+1 || *end || length < 0 || length > 1024) {
+    abortSmsTransaction(); return;
+  }
+  long index = strtol(gsmLine+6, &end, 10);
+  if (end == gsmLine+6 || *end != ',' || index < 0 || index > 32767) {
+    abortSmsTransaction(); return;
+  }
+  bodyRemaining = (uint16_t)length;
+  captureBody = false;
+  if (readIndex < 0) {
+    char sender[24] = "";
+    readIndex = (int)index;
+    bodyStored = 0;
+    smsBuffer[0] = '\0';
+    captureBody = extractQuoted(gsmLine,2,sender,sizeof(sender)) && isAdmin(sender);
+    captureComplete = captureBody && bodyRemaining == 0;
+  }
+  setSmsState(captureBody ? SMS_READ_BODY : SMS_SKIP_BODY);
+}
 
-  /* +CMTI is only a trigger. Actual reading always goes through
-     the CMGL poll - a missed notification cannot lose a message. */
-  if (strncmp(gsmLine, "+CMTI:", 6) == 0) {
-    pollDue = true;
+/* Called only outside the length-delimited body. */
+void handleGsmLine() {
+  if (!gsmLine[0]) return;
+  DBG_PRINT(F("<< ")); DBG_PRINTLN(gsmLine);
+  if (!strncmp(gsmLine,"+CMTI:",6)) { pollDue=true; return; }
+  bool isOk = !strcmp(gsmLine,"OK");
+  bool isErr = !strcmp(gsmLine,"ERROR") ||
+      !strncmp(gsmLine,"+CMS ERROR",10) || !strncmp(gsmLine,"+CME ERROR",10);
+  if (smsState == SMS_WAIT_DEL_OK) {
+    if (isOk || isErr) setSmsState(SMS_IDLE);
     return;
   }
-
-  bool isOk  = (strcmp(gsmLine, "OK") == 0);
-  bool isErr = (strcmp(gsmLine, "ERROR") == 0) ||
-               (strncmp(gsmLine, "+CMS ERROR", 10) == 0) ||
-               (strncmp(gsmLine, "+CME ERROR", 10) == 0);
-
-  switch (smsState) {
-
-    case SMS_WAIT_HEADER:
-      if (strncmp(gsmLine, "+CMGL:", 6) == 0)  handleCmglHeader();
-      else if (isOk || isErr)                  setSmsState(SMS_IDLE); // empty list
-      break;
-
-    case SMS_READ_BODY:
-      if (strncmp(gsmLine, "+CMGL:", 6) == 0) {
-        /* Another message follows in the list - finish the first one,
-           skip the rest for now; the chain-poll will fetch them.
-           readIndex still refers to the first message (to delete). */
-        finishCapturedMsg();
-        setSmsState(SMS_SKIP_BODY);
-      }
-      else if (isOk || isErr) {
-        finishCapturedMsg();
-        endTransaction();
-      }
-      else {
-        /* Body line - multi-line SMS parts are joined with a space */
-        size_t cur = strlen(smsBuffer);
-        if (cur > 0 && cur < sizeof(smsBuffer) - 2) {
-          smsBuffer[cur++] = ' ';
-          smsBuffer[cur] = '\0';
-        }
-        strncat(smsBuffer, gsmLine, sizeof(smsBuffer) - strlen(smsBuffer) - 1);
-      }
-      break;
-
-    case SMS_SKIP_BODY:
-      if (isOk || isErr) endTransaction();
-      break;
-
-    case SMS_WAIT_DEL_OK:
-      if (isOk || isErr) setSmsState(SMS_IDLE);
-      break;
-
-    case SMS_IDLE:
-    default:
-      break;
+  if (smsState == SMS_IDLE) return;
+  if (isErr) { abortSmsTransaction(); return; }
+  if (!strncmp(gsmLine,"+CMGL:",6)) { handleCmglHeader(); return; }
+  if (isOk) {
+    if (captureComplete) finishCapturedMsg();
+    if (readIndex >= 0) endTransaction();
+    else setSmsState(SMS_IDLE);
   }
 }
 
 /* Non-blocking char-by-char RX with a fixed line buffer */
 void gsmRxProcess() {
   while (GSM.available()) {
-    char c = GSM.read();
+    char c = (char)GSM.read();
+    if (bodyRemaining) {
+      --bodyRemaining;
+      if (captureBody && bodyStored < sizeof(smsBuffer)-1) {
+        // DMD font is single-byte; flatten body line breaks for scrolling.
+        smsBuffer[bodyStored++] = (c == '\r' || c == '\n') ? ' ' : c;
+        smsBuffer[bodyStored] = '\0';
+      }
+      if (!bodyRemaining && captureBody) captureComplete = true;
+      continue;
+    }
     if (c == '\n') {
       gsmLine[gsmLineLen] = '\0';
-      handleGsmLine();
+      if (gsmLineOverflow) abortSmsTransaction();
+      else handleGsmLine();
       gsmLineLen = 0;
+      gsmLineOverflow = false;
     }
     else if (c != '\r') {
-      if (gsmLineLen < sizeof(gsmLine) - 1) gsmLine[gsmLineLen++] = c;
+      if (gsmLineLen < sizeof(gsmLine)-1) gsmLine[gsmLineLen++] = c;
+      else gsmLineOverflow = true;
     }
   }
 }
@@ -449,7 +440,9 @@ void loop() {
   /* Stuck-transaction auto-recovery */
   if (smsState != SMS_IDLE && millis() - smsStateTime > SMS_STATE_TIMEOUT_MS) {
     DBG_PRINTLN(F("!! SMS state timeout -> reset"));
-    setSmsState(SMS_IDLE);
+    abortSmsTransaction();
+    gsmLineLen = 0;
+    gsmLineOverflow = false;
   }
 
   /* Poll: +CMTI trigger, chain-poll, or 10 s fallback */
