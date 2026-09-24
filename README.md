@@ -1,14 +1,14 @@
 # SMS-Controlled P10 LED Notice Board
 
-An SMS-driven scrolling notice board built on an **Arduino Mega 2560**, a **SIM800/SIM900 GSM module**, and a **P10 LED matrix display (2×1, HUB12)**. Send a text message from an authorized phone number and it scrolls on the display. Designed to run 24/7 unattended.
+An SMS-driven scrolling notice board built on an **Arduino Mega 2560**, a **SIM800/SIM900 GSM module**, and a **P10 LED matrix display (2×1, HUB12)**. Send a text message from an authorized phone number and it scrolls on the display. This is a hardware prototype; unattended reliability has not been established by a soak test.
 
 ## Features
 
-- **Admin authentication** — only SMS from whitelisted numbers are displayed (matched on the last 10 digits, so `+91xxxxxxxxxx`, `91xxxxxxxxxx`, and plain 10-digit formats all work). Messages from unknown numbers are deleted and ignored.
-- **Notification-independent SMS engine** — the `+CMTI` unsolicited notification is used only as a trigger. Actual message retrieval is done by polling `AT+CMGL="ALL"`, with a 10-second fallback poll. A missed notification can never cause a lost message.
+- **Sender filtering** — only SMS from whitelisted numbers are displayed (requires 10–15 digits and matches the last 10, so `+91xxxxxxxxxx`, `91xxxxxxxxxx`, and plain 10-digit formats all work). Messages from unknown numbers are deleted and ignored.
+- **Notification-independent SMS engine** — the `+CMTI` unsolicited notification is used only as a trigger. Actual message retrieval is done by polling `AT+CMGL="ALL"`, with a 10-second fallback poll. Periodic polling can recover from missed notifications, but does not guarantee lossless delivery.
 - **Message queueing** — a new SMS waits for the current message to finish its scroll pass, then takes over. While a pass is in progress, only the latest incoming SMS is kept.
 - **O(1) windowed rendering** — only the ~13 visible characters are drawn per frame, so frame time is constant regardless of message length (up to 299 characters). Long messages scroll as smoothly as short ones.
-- **EEPROM persistence** — the last displayed message is restored and scrolled again after a power cut (`EEPROM.update()` is used to preserve write endurance).
+- **EEPROM persistence** — two CRC-checked slots retain the previous committed message if a write is interrupted. `EEPROM.update()` avoids rewriting unchanged bytes.
 - **Robust AT handling** — `+CMS ERROR` / `+CME ERROR` responses are recognized, a per-message storage-index delete avoids races with incoming SMS, and an 8-second state timeout auto-recovers any stuck transaction.
 - **No heap usage in the hot path** — fixed `char` buffers throughout, no `String` class, no heap fragmentation over long uptimes.
 
@@ -89,7 +89,7 @@ Most "code not working" reports with this hardware are power problems:
 Free RAM: 6xxx
 << +CMTI: "SM",1
 >> AT+CMGL="ALL"        (sent automatically)
-<< +CMGL: 1,"REC UNREAD","+91XXXXXXXXXX","","26/07/20,10:30:00+22"
+<< +CMGL: 1,"REC UNREAD","+91XXXXXXXXXX","","26/07/20,10:30:00+22",145,18
 SMS from ADMIN: +91XXXXXXXXXX
 << HELLO NOTICE BOARD
 NOW SCROLLING: HELLO NOTICE BOARD
@@ -103,11 +103,11 @@ UNAUTHORIZED sender: +91YYYYYYYYYY -> ignore & delete
 
 ## How It Works
 
-**SMS engine.** New-message notifications (`+CMTI`) only raise a poll flag. The main loop, whenever the SMS state machine is idle, issues `AT+CMGL="ALL"` — on notification, after every completed transaction (chain-poll), and at least every 10 seconds. The state machine walks the CMGL response: header → sender authentication → body capture (multi-line parts joined) → `OK` → targeted `AT+CMGD=<index>` delete. Anything left in storage is drained by the chain-poll, one message per transaction.
+**SMS engine.** New-message notifications (`+CMTI`) only raise a poll flag. The main loop, whenever the SMS state machine is idle, issues `AT+CMGL="ALL"` — on notification, after every completed transaction (chain-poll), and at least every 10 seconds. The state machine walks the CMGL response: extended header → sender filtering → length-delimited body capture → final `OK` → targeted `AT+CMGD=<index>` delete. Anything left in storage is drained by the chain-poll, one message per transaction.
 
 **Display engine.** Rendering is non-blocking and windowed: from the current scroll offset the sketch computes which character sits at the left edge and draws only the visible substring. The message pixel width is computed once per message, not per frame. When the message fully exits the left edge, the queued message (if any) is loaded; otherwise the same message repeats.
 
-**Persistence.** Each message put on display is written to EEPROM (length-prefixed, magic-byte validated) using `EEPROM.update()`, which skips unchanged bytes. During the slow byte writes the GSM UART is drained to prevent RX overflow. On boot, a valid stored message immediately resumes scrolling.
+**Persistence.** Two EEPROM slots store a length, sequence number, CRC and commit marker. The inactive slot is invalidated first and committed last, so an interrupted update leaves the previous valid slot available. UART reception is serviced during payload writes. On boot the newest valid slot resumes scrolling. The old single-slot format is ignored; send a new message after upgrading.
 
 ## Troubleshooting
 
@@ -134,3 +134,37 @@ UNAUTHORIZED sender: +91YYYYYYYYYY -> ignore & delete
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Validation and limitations
+
+Run the sender-boundary regression suite with:
+
+```sh
+g++ -std=c++11 -Wall -Wextra -Werror tests/test_phone_match.cpp -o test_phone_match
+./test_phone_match
+g++ -std=c++11 -Wall -Wextra -Werror tests/test_protocol.cpp -o test_protocol
+./test_protocol
+```
+
+The CI workflow also compiles the actual sketch for Arduino Mega 2560 with
+the pinned AVR core and DMD2 library. Compilation and host tests do not prove
+display timing, supply integrity, or unattended operation.
+
+- The display has one pending slot: newer messages replace older pending messages.
+- Boot preserves SIM messages; normal polling reads and deletes individual indexes.
+- `AT+CSDH=1` enables body lengths and `AT+CSCS="IRA"` selects a single-byte
+  terminal character set. The parser consumes the declared body before
+  interpreting response tokens, including embedded line breaks. Missing or
+  invalid lengths abort without deleting the message; incomplete transactions
+  time out. The display stores at most 299 characters while draining the rest.
+- The host suite includes literal `OK`/`ERROR` and header-like bodies,
+  fragmented input, multiple messages, truncation, timeout recovery, EEPROM
+  corruption, and simulated power loss at each write boundary.
+- Modem framing follows the [SIM800 AT command manual, sections 4.2.3 and
+  4.2.14](https://simcom.ee/documents/SIM800C/SIM800%20Series_AT%20Command%20Manual_V1.10.pdf).
+  Confirm extended-header behavior on your exact SIM800/SIM900 firmware.
+  The display does not decode UCS2 or reassemble concatenated SMS.
+- EEPROM records are CRC-checked, not cryptographically authenticated.
+  Brownout behavior and actual EEPROM endurance still require board testing.
+- Sender-number filtering is not cryptographic authentication. The configured
+  suffix policy intentionally treats matching last-ten-digit numbers alike.
